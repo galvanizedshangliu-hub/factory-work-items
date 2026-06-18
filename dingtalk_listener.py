@@ -3,10 +3,8 @@
 接入 DeepSeek Agent + 本地数据缓存
 
 消息路由：
-1. 日报请求 → 直接用缓存计算（秒级）
-2. 周报请求 → 直接用缓存计算（秒级）
-3. 个人查询 → 直接用缓存计算（秒级）
-4. 其他问题 → 交给 Agent 处理（需要时才读 WPS）
+所有消息统一走 DeepSeek LLM 做意图分类（关键词匹配已退役）
+LLM 失败时关键词兜底（日报/周报/本周/月报）
 """
 import os, sys, json, re, threading, requests, time
 from datetime import datetime, timedelta
@@ -158,66 +156,41 @@ def extract_person(text: str) -> str:
 # 意图识别 + 缓存路由
 # ═══════════════════════════════════════════════════
 
-def classify_intent(text: str) -> dict:
-    """
-    识别用户意图，决定走缓存还是 Agent。
-    返回 {"type": "daily_report"|"weekly_report"|"person_query"|"agent", ...}
-    """
+def classify_intent_fallback(text: str) -> dict:
+    """LLM 失败时的关键词兜底路由。只匹配最明确的模式，其余走 agent。"""
     text_lower = text.strip()
 
-    # 计划单请求（文件 + 关键字）
+    # 计划单
     if any(kw in text_lower for kw in ["计划单", "排产", "生产计划", "排单"]):
         return {"type": "planning"}
 
-    # 日报请求
+    # 日报关键词
     if any(kw in text_lower for kw in ["生成日报", "发送日报", "生产日报", "今日日报", "昨日日报",
-                                         "生成报表", "生产报表", "日报表", "生成报告"]):
-        return {"type": "daily_report", "date": extract_date(text)}
-
-    # 日报（带"日报""报表"后缀）
-    if "日报" in text_lower or "报表" in text_lower or "报告" in text_lower:
+                                         "生成报表", "生产报表", "日报表", "生成报告", "日报", "报表"]):
         return {"type": "daily_report", "date": extract_date(text)}
 
     # 本周
-    if any(kw in text_lower for kw in ["本周", "这周"]):
+    if any(kw in text_lower for kw in ["本周", "这周", "这个星期", "这个礼拜"]):
         return {"type": "this_week"}
 
-    # 月报请求
+    # 月报
     if any(kw in text_lower for kw in ["月报", "本月", "这个月", "当月"]):
         return {"type": "monthly_report"}
 
-    # 周报请求（默认 = 上周）
+    # 周报
     if any(kw in text_lower for kw in ["周报", "上周", "最近7天", "最近七天", "近7天", "近七天"]):
         return {"type": "weekly_report"}
 
-    # 最近N天（如"最近3天"）
+    # 最近N天
     m = re.search(r'最近\s*(\d+)\s*天', text_lower)
     if m:
         return {"type": "recent_days", "days": int(m.group(1))}
 
-    # 个人查询（放在开放式问题之前，避免"王鸽""查王鸽"被吃掉）
+    # 个人查询
     person = extract_person(text)
-    if person and any(kw in text_lower for kw in ["做了多少", "产量", "数据", "统计", "查", "记录", "生产情况", "做了啥"]):
-        return {"type": "person_query", "person": person, "date": extract_date(text)}
-    # 纯人名短消息 → 查这个人的近期
-    if person and len(text_lower.replace(" ", "")) <= 5:
+    if person:
         return {"type": "person_recent_days", "person": person, "days": 7}
 
-    # 简单对话/开放式问题 — 交给 LLM（只对非查询类消息生效）
-    if len(text_lower) <= 2 or any(kw in text_lower for kw in ["你好", "在吗", "嗨", "谢谢", "辛苦了", "早安", "晚安"]):
-        return {"type": "agent"}
-    if any(kw in text_lower for kw in ["怎么样", "如何", "谁最", "哪个最", "哪个机台"]):
-        return {"type": "agent"}
-
-    # 某天的产量查询（如 "6.14产量多少" "昨天产量"）
-    if any(kw in text_lower for kw in ["产量", "生产情况", "生产了多少"]):
-        return {"type": "daily_report", "date": extract_date(text)}
-
-    # 不合格品查询
-    if any(kw in text_lower for kw in ["不合格", "不良", "质量问题"]):
-        return {"type": "daily_report", "date": extract_date(text)}
-
-    # 默认走 Agent
     return {"type": "agent"}
 
 
@@ -248,11 +221,12 @@ def _parse_json_response(raw: str) -> dict:
 
 def llm_classify_intent(text: str) -> dict:
     """
-    LLM 兜底路由 - 只处理关键词匹配不到的模糊语义。
-    关键词已经过滤了：日报/周报/月报/本周/最近N天/人员查询等明确请求。
-    这里只判断：direct_answer（能回答）vs person_recent_days（查某人最近）vs agent（需读原始数据）
+    统一 LLM 路由：所有消息都走这里做意图分类。
+    返回所有可能的 type：daily_report / weekly_report / this_week / monthly_report /
+    recent_days / person_query / person_recent_days / direct_answer / agent / planning
+    LLM 失败时走 classify_intent_fallback 关键词兜底。
     """
-    log(f"🔄 LLM兜底路由: {text[:50]}")
+    log(f"🧠 LLM路由: {text[:50]}")
     from openai import OpenAI
     from tools.cache_manager import get_cache_summary
 
@@ -272,25 +246,39 @@ def llm_classify_intent(text: str) -> dict:
     today_str = f"{now.month}月{now.day}日"
     weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     today_weekday = weekday_names[now.weekday()]
+    yesterday = now - timedelta(days=1)
+    yesterday_str = f"{yesterday.month}月{yesterday.day}日"
 
-    system_prompt = f"""你是车间生产统计助手。当前时间{today_str} {today_weekday}。
+    system_prompt = f"""你是车间生产统计助手。当前时间{today_str} {today_weekday}，昨天是{yesterday_str}。
 
 ## 生产数据摘要
 {summary}
 
 ## 任务
-根据用户问题和数据摘要，选择最合适的处理方式。
+分析用户意图，选择最合适的处理方式。
 
 ## 输出格式（严格JSON）
-{{"route": "direct_answer" 或 "person_recent_days" 或 "agent", "params": {{}}, "answer": "direct_answer时直接回答"}}
+{{"route": "<路由类型>", "params": {{}}, "answer": ""}}
 
-## 路由规则
-- direct_answer：问题能从数据摘要中找到答案（问候/产量情况/谁产量高/最近怎么样/异常情况/趋势等），直接用自然语言回答
-- person_recent_days：用户要查特定某人最近的表现/数据，params.person填姓名，params.days默认7
-- agent：问题复杂、摘要数据不够、或需要调原始数据分析时走这个
+## 路由类型说明
+- daily_report：用户要某一天的日报（"昨天怎么样""6.14日报"）。params.date填"X月X日"格式。
+- weekly_report：用户要上周的周报（"周报""上周的情况"）
+- this_week：用户要本周到目前的统计（"本周""这个星期""这周到现在"）
+- monthly_report：用户要本月的月报（"月报""本月""这个月"）
+- recent_days：用户要最近N天的统计（"最近3天"）。params.days填数字。
+- person_query：用户要查某人某天的数据（"王鸽昨天干了啥"）。params.person填姓名，params.date填日期。
+- person_recent_days：用户要查某人最近的表现（"王鸽最近7天""查张三"）。params.person填姓名，params.days默认7。
+- direct_answer：简单问题能从摘要回答（问候、闲聊、"最近产量最高的是谁"）。answer字段直接回复。
+- agent：问题复杂、需要读原始数据、要筛选特定条件（如"硫酸铜不合格""锌层不良""机台7效率对比""强度不合格"）等走这个。
+- planning：用户要排产/计算计划单。
+
+## 关键规则
+- 含"不合格""不良""质量问题""硫酸铜""锌层""强度""断裂"等筛选条件的 → agent
+- 含"这个星期""本周""这周"等时间词 + 任意条件的 → this_week 或 agent（取决于是否只需看本周数据）
+- 不确定时优先选 agent
 
 ## 回答风格
-简洁直接，像同事对话。数据准确引用，不确定直说需要查。"""
+direct_answer 时简洁直接，像同事对话。"""
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history_msgs)
@@ -307,33 +295,39 @@ def llm_classify_intent(text: str) -> dict:
 
         raw = response.choices[0].message.content
         result = _parse_json_response(raw)
-        route = result.get("route", "direct_answer")
+        route = result.get("route", "agent")
         params = result.get("params", {})
         answer = result.get("answer", "")
 
-        log(f"🧠 LLM路由: {route} | answer={answer[:60] if answer else '无'}")
+        log(f"🧠 LLM路由结果: {route} | params={params} | answer={answer[:60] if answer else '无'}")
 
         # 记录对话历史
         _msg_history.append(("user", text))
         if answer:
             _msg_history.append(("assistant", answer))
-        # 保持历史长度
         while len(_msg_history) > _MAX_HISTORY:
             _msg_history.pop(0)
 
-        # 构造 intent（LLM 只返回 direct_answer / person_recent_days / agent）
+        # 构造 intent
         intent = {"type": route}
-        if route == "person_recent_days":
-            intent["person"] = params.get("person", "")
+        if route == "daily_report":
+            intent["date"] = params.get("date", yesterday_str)
+        elif route == "recent_days":
             intent["days"] = params.get("days", 7)
+        elif route in ("person_query", "person_recent_days"):
+            intent["person"] = params.get("person", "")
+            if route == "person_query":
+                intent["date"] = params.get("date", yesterday_str)
+            else:
+                intent["days"] = params.get("days", 7)
         elif route == "direct_answer":
             intent["answer"] = answer or "抱歉，我无法从现有数据回答这个问题。"
 
         return intent
 
     except Exception as e:
-        log(f"⚠️ LLM兜底路由失败: {e}")
-        return {"type": "agent"}
+        log(f"⚠️ LLM路由失败，降级关键词兜底: {e}")
+        return classify_intent_fallback(text)
 
 
 # ═══════════════════════════════════════════════════
@@ -920,11 +914,8 @@ def main():
                         reply(webhook, "请回复数字 1-4 选择方案：\n1️⃣ 自动对比 2️⃣ 优先630 3️⃣ 只用500 4️⃣ 只用630")
                         return AckMessage.STATUS_OK, "ok"
 
-                # 意图识别：关键词优先匹配，只有模糊语义才走 LLM
-                intent = classify_intent(text)
-                if intent["type"] == "agent":
-                    # 关键词未命中，交给 LLM 做二次判断
-                    intent = llm_classify_intent(text)
+                # 意图识别：统一走 LLM，失败时关键词兜底
+                intent = llm_classify_intent(text)
                 log(f"🎯 意图: {intent['type']}")
 
                 if intent["type"] == "daily_report":
