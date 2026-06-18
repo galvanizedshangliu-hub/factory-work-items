@@ -1,0 +1,49 @@
+# Ignore sensitive and runtime files
+data/wps_storage_state.json
+data/wps_cookies.txt
+.env
+logs/
+__pycache__/
+.pytest_cache/
+.vscode/
+*.pyc
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# 敏感凭证
+*.token
+*.secret
+*.key
+.env
+
+# 数据文件（含缓存和认证状态）
+data/cache/
+data/last_parsed_file.json
+data/last_row_cache.json
+data/wps_cookies.txt
+data/wps_storage_state.json
+
+# 日志
+logs/
+*.log
+
+# 进程锁
+.listener.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 测试临时文件
+.mypy_cache/
+.pytest_cache/
