@@ -156,9 +156,27 @@ def extract_person(text: str) -> str:
 # 意图识别 + 缓存路由
 # ═══════════════════════════════════════════════════
 
-def classify_intent_fallback(text: str) -> dict:
-    """LLM 失败时的关键词兜底路由。只匹配最明确的模式，其余走 agent。"""
+# 复杂查询标记：这些词表示用户要筛选/追问，不是要整份报表
+_COMPLEX_MARKERS = [
+    "不合格", "不良品", "次品", "质量问题",
+    "哪些", "明细", "什么原因", "都有哪些", "都有什么",
+    "硫酸铜", "锌层", "锌重", "强度", "捻制",
+    "对比", "分析一下", "帮我分析",
+    "多少", "几个", "几次",
+]
+
+
+def _is_complex_query(text: str) -> bool:
+    """检查消息是否包含复杂筛选条件"""
+    return any(kw in text for kw in _COMPLEX_MARKERS)
+
+
+def classify_intent(text: str) -> dict:
+    """关键词优先路由。纯报表请求走缓存，带筛选条件的交给 agent。"""
     text_lower = text.strip()
+
+    # 复杂查询检测
+    has_complex = _is_complex_query(text_lower)
 
     # 计划单
     if any(kw in text_lower for kw in ["计划单", "排产", "生产计划", "排单"]):
@@ -167,29 +185,43 @@ def classify_intent_fallback(text: str) -> dict:
     # 日报关键词
     if any(kw in text_lower for kw in ["生成日报", "发送日报", "生产日报", "今日日报", "昨日日报",
                                          "生成报表", "生产报表", "日报表", "生成报告", "日报", "报表"]):
+        if has_complex:
+            return {"type": "agent"}
         return {"type": "daily_report", "date": extract_date(text)}
 
     # 本周
     if any(kw in text_lower for kw in ["本周", "这周", "这个星期", "这个礼拜"]):
+        if has_complex:
+            return {"type": "agent"}
         return {"type": "this_week"}
 
     # 月报
     if any(kw in text_lower for kw in ["月报", "本月", "这个月", "当月"]):
+        if has_complex:
+            return {"type": "agent"}
         return {"type": "monthly_report"}
 
     # 周报
     if any(kw in text_lower for kw in ["周报", "上周", "最近7天", "最近七天", "近7天", "近七天"]):
+        if has_complex:
+            return {"type": "agent"}
         return {"type": "weekly_report"}
 
     # 最近N天
     m = re.search(r'最近\s*(\d+)\s*天', text_lower)
     if m:
+        if has_complex:
+            return {"type": "agent"}
         return {"type": "recent_days", "days": int(m.group(1))}
 
     # 个人查询
     person = extract_person(text)
     if person:
         return {"type": "person_recent_days", "person": person, "days": 7}
+
+    # 带筛选词但没有时间词 → agent
+    if has_complex:
+        return {"type": "agent"}
 
     return {"type": "agent"}
 
@@ -224,7 +256,7 @@ def llm_classify_intent(text: str) -> dict:
     统一 LLM 路由：所有消息都走这里做意图分类。
     返回所有可能的 type：daily_report / weekly_report / this_week / monthly_report /
     recent_days / person_query / person_recent_days / direct_answer / agent / planning
-    LLM 失败时走 classify_intent_fallback 关键词兜底。
+    LLM 失败时走 classify_intent 关键词兜底。
     """
     log(f"🧠 LLM路由: {text[:50]}")
     from openai import OpenAI
@@ -327,7 +359,7 @@ direct_answer 时简洁直接，像同事对话。"""
 
     except Exception as e:
         log(f"⚠️ LLM路由失败，降级关键词兜底: {e}")
-        return classify_intent_fallback(text)
+        return classify_intent(text)
 
 
 # ═══════════════════════════════════════════════════
@@ -598,7 +630,7 @@ def handle_agent(text: str, webhook: str):
         log(f"🤖 Agent 处理中: {text[:60]}")
         prompt = (
             f"[群聊消息，由系统自动转发回复，你只需返回文字内容，不要调用 format_and_send_report]\n"
-            f"[效率要求：尽量一次工具调用搞定，不要反复读取不同范围]\n"
+            f"[⚡ 优先使用缓存工具 cache_stats / cache_query / cache_get_summary，缓存有2125行最新数据，秒级返回，无需浏览器！只有缓存不够时才用 WPS 浏览器工具]\n"
             f"用户({text})"
         )
         answer = run_agent(prompt, max_rounds=8, verbose=False)
@@ -914,9 +946,12 @@ def main():
                         reply(webhook, "请回复数字 1-4 选择方案：\n1️⃣ 自动对比 2️⃣ 优先630 3️⃣ 只用500 4️⃣ 只用630")
                         return AckMessage.STATUS_OK, "ok"
 
-                # 意图识别：统一走 LLM，失败时关键词兜底
-                intent = llm_classify_intent(text)
-                log(f"🎯 意图: {intent['type']}")
+                # 意图识别：关键词优先 → 命中直接走缓存 → 未命中走 LLM
+                intent = classify_intent(text)
+                from_kw = intent["type"] != "agent"
+                if intent["type"] == "agent":
+                    intent = llm_classify_intent(text)
+                log(f"🎯 意图: {intent['type']} ({'关键词命中' if from_kw else 'LLM'})")
 
                 if intent["type"] == "daily_report":
                     reply(webhook, f"⏳ 正在生成 {intent['date']} 日报...")
